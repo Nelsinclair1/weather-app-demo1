@@ -1,0 +1,104 @@
+name: Build and Deploy to AKS
+
+on:
+  push:
+    branches: [main]
+  workflow_run:
+    workflows: ["CI - Build and Test"]
+    types: [completed]
+    branches: [main]
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 9.0
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '9.0.x'
+
+      - name: Restore dependencies
+        run: dotnet restore WeatherApp/WeatherApp.csproj
+
+      - name: Build application
+        run: dotnet build WeatherApp/WeatherApp.csproj --configuration Release --no-restore
+
+      - name: Run tests
+        run: dotnet test WeatherApp/WeatherApp.csproj --no-build --verbosity normal
+
+      - name: Azure Login
+        uses: azure/login@v1
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        run: |
+          az acr login --name ${{ secrets.ACR_NAME }}
+
+      - name: Set IMAGE_NAME environment variable
+        run: echo "IMAGE_NAME=weather-app" >> $GITHUB_ENV
+
+      - name: Set NAMESPACE environment variable
+        run: echo "NAMESPACE=default" >> $GITHUB_ENV
+
+      - name: Build and push Docker image to ACR
+        run: |
+          IMAGE_TAG=${{ secrets.ACR_NAME }}.azurecr.io/$IMAGE_NAME:${{ github.sha }}
+          docker build -t $IMAGE_TAG WeatherApp/
+          docker push $IMAGE_TAG
+          echo "IMAGE_TAG=$IMAGE_TAG" >> $GITHUB_ENV
+
+      - name: Test Docker image
+        run: |
+          docker run -d -p 8080:8080 -e ASPNETCORE_URLS=http://+:8080 --name test-container $IMAGE_TAG
+          sleep 10
+          docker logs test-container
+          curl -f http://localhost:8080/health || exit 1
+          docker stop test-container
+          docker rm test-container
+
+      - name: Deploy to AKS
+        if: github.ref == 'refs/heads/main'
+        run: |
+          # Get AKS credentials
+          az aks get-credentials \
+            --resource-group ${{ secrets.RESOURCE_GROUP }} \
+            --name ${{ secrets.CLUSTER_NAME }} \
+            --overwrite-existing
+
+          # Check if deployment exists, if not create it
+          if ! kubectl get deployment/weather-app -n default > /dev/null 2>&1; then
+            echo "Creating new deployment..."
+            if [ -d "k8s/" ]; then
+              kubectl apply -f k8s/ -n default
+            else
+              echo "No k8s/ directory found. Please create Kubernetes manifests."
+              exit 1
+            fi
+          else
+            echo "Updating existing deployment..."
+            kubectl set image deployment/weather-app \
+              weather-app=$IMAGE_TAG \
+              -n default \
+              --record
+          fi
+
+          # Wait for deployment to complete
+          kubectl rollout status deployment/weather-app -n default --timeout=300s
+
+          # Get service info
+          kubectl get service weather-app-service -n default || echo "Service not found"
+
+          # Verify pods
+          kubectl get pods -n default -l app=weather-app
+
+          # Simple smoke test
+          kubectl port-forward service/weather-app-service 8080:80 -n default &
+          sleep 5
+          curl -f http://localhost:8080/health || echo "Health check failed"
+          pkill -f "kubectl port-forward"
